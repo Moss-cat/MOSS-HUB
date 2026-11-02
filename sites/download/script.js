@@ -1,14 +1,15 @@
 /* MOSS 下载站 · script.js
  *
- * 共享存储版（GitHub 后端）：
- *   · 上传的文件真正存进 Moss-cat/MOSS-HUB 仓库的 files/ 目录，所有人打开都能看到、下载
- *   · 下载走 raw.githubusercontent.com 真实直链，由 MOSS 浏览器（moss:dl）存到系统下载目录
+ * 共享存储版（Cloudflare R2 + Worker 后端）：
+ *   · 上传的文件真正存进 R2 桶的 files/<id>，免费 10GB、出流量免费、不挤占 GitHub
+ *   · 浏览器经 Cloudflare Worker 读写（密钥 x-moss-key 藏在 Worker 里，前端看不到）
+ *   · 下载走 R2 公开地址（r2.dev），由 MOSS 浏览器（moss:dl）存到系统下载目录
  *   · 上传者（账号用户名）记录在 files/_index.json，下载页一眼可见
  *   · 举报写进 files/_reports.json，站长在「举报」标签页查看
  *   · 账号（注册/登录/7 天会话）仍是纯前端，只用于标记「谁上传的」
  *
- * 凭证来自浏览器注入的 window.MOSS_CONFIG.hub（token 不进公开站点源码）。
- * 直接用普通浏览器打开本页面也能看下载列表（公开），但上传/举报需要 MOSS 浏览器。
+ * 配置来自浏览器注入的 window.MOSS_CONFIG.files（api/pub/key 不进公开站点源码）。
+ * 直接用普通浏览器打开本页面也能看下载列表（公开读），但上传/举报需要 MOSS 浏览器。
  */
 "use strict";
 
@@ -86,99 +87,80 @@ function lsSet(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
 }
 
-/* ---------------- GitHub 共享后端 ---------------- */
-var HUB = (window.MOSS_CONFIG && window.MOSS_CONFIG.hub) || null;
-var OWNER  = HUB ? HUB.owner  : "";
-var REPO   = HUB ? HUB.repo   : "";
-var BRANCH = HUB ? (HUB.branch || "main") : "main";
-var TOKEN  = HUB ? HUB.token  : "";
-var CAN_WRITE = !!(OWNER && REPO && TOKEN);
+/* ---------------- Cloudflare R2 + Worker 共享后端 ---------------- */
+// 配置来自浏览器注入的 window.MOSS_CONFIG.files
+var FC = (window.MOSS_CONFIG && window.MOSS_CONFIG.files) || null;
+var API = FC ? (FC.api || "") : "";     // Worker 地址（读写，藏密钥）
+var PUB = FC ? (FC.pub || "") : "";     // R2 公开读地址（下载用）
+var KEY = FC ? (FC.key || "") : "";     // 写操作闸门（与 Worker 的 MOSS_KEY 一致）
+// 能写 = 浏览器注入了有效的 api + key（即 MOSS 浏览器）
+var CAN_WRITE = !!(API && KEY);
 
-var FILES_DIR = "files";
-var INDEX_PATH = FILES_DIR + "/_index.json";
-var REPORTS_PATH = FILES_DIR + "/_reports.json";
+// 读接口优先走 Worker（带 CORS）；没有就退回 R2 公开地址（普通浏览器可见列表）
+function readUrl(path) { return (API || PUB) + "/" + path; }
+function apiUrl(path) { return API + "/" + path; }
+function pubUrl(path) { return PUB + "/" + path; }
 
-function rawUrl(path) {
-  return "https://raw.githubusercontent.com/" + OWNER + "/" + REPO + "/" +
-         BRANCH + "/" + path;
-}
-function apiUrl(path) {
-  return "https://api.github.com/repos/" + OWNER + "/" + REPO +
-         "/contents/" + path;
-}
-function authHeaders(extra) {
-  var h = { "Authorization": "Bearer " + TOKEN,
-            "Accept": "application/vnd.github+json" };
-  if (extra) Object.keys(extra).forEach(function (k) { h[k] = extra[k]; });
-  return h;
-}
-// UTF-8 安全的 base64（索引/举报里含中文用户名、中文文件名）
-function b64enc(str) { return btoa(unescape(encodeURIComponent(str))); }
-function b64dec(b64) { return decodeURIComponent(escape(atob(b64))); }
-
-// 读取某个仓库文件：返回 { contentB64, sha }，404 返回 null
-async function getContent(path) {
-  var resp = await fetch(apiUrl(path), { headers: authHeaders() });
+// GET 一个小 JSON（索引/举报）：404 返回 null，其它错误抛异常
+async function getJsonViaWorker(path) {
+  var resp = await fetch(readUrl(path));
   if (resp.status === 404) return null;
   if (!resp.ok) throw new Error("读取失败 " + resp.status);
-  var j = await resp.json();
-  return { contentB64: j.content, sha: j.sha };
+  return await resp.json();
 }
-// 公开读取索引（无需 token）：返回条目数组
+
+// 公开读取索引：返回条目数组（任何异常都降级为空，不影响页面显示）
 async function getIndex() {
   try {
-    var resp = await fetch(rawUrl(INDEX_PATH));
-    if (resp.status === 404) return [];
-    if (!resp.ok) throw new Error();
-    var arr = JSON.parse(await resp.text());
+    var j = await getJsonViaWorker("files/_index.json");
+    var arr = j || [];
     return Array.isArray(arr) ? arr : [];
   } catch (e) { return []; }
 }
 async function getReports() {
   try {
-    var resp = await fetch(rawUrl(REPORTS_PATH));
-    if (resp.status === 404) return [];
-    if (!resp.ok) throw new Error();
-    var arr = JSON.parse(await resp.text());
-    return Array.isArray(arr) ? arr : [];
+    var j = await getJsonViaWorker("files/_reports.json");
+    return Array.isArray(j) ? j : [];
   } catch (e) { return []; }
 }
 
-// 读取-修改-写入一个 JSON 文件（带冲突重试）
-async function rmwJson(path, mutate, message) {
-  var attempts = 0;
-  while (attempts < 4) {
-    attempts++;
-    var cur = null, sha = null;
-    try { cur = await getContent(path); } catch (e) { cur = null; }
-    var data = [];
-    if (cur) {
-      try { data = JSON.parse(b64dec(cur.contentB64)) || []; } catch (e) { data = []; }
-      sha = cur.sha;
-    }
-    var next = mutate(data) || data;
-    var body = {
-      message: message,
-      content: b64enc(JSON.stringify(next, null, 0)),
-      branch: BRANCH
-    };
-    if (sha) body.sha = sha;
-    var resp = await fetch(apiUrl(path), {
-      method: "PUT",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(body)
-    });
-    if (resp.ok) return next;
-    if (resp.status === 409) continue;   // 并发冲突，重读重写
-    var err = await resp.text().catch(function(){return "";});
-    throw new Error("更新失败 " + resp.status + " " + err.slice(0, 160));
+// PUT 原始字节到 Worker（写文件本体或 JSON）
+async function putRaw(path, body, contentType) {
+  var resp = await fetch(apiUrl(path), {
+    method: "PUT",
+    headers: {
+      "x-moss-key": KEY,
+      "Content-Type": contentType || "application/octet-stream"
+    },
+    body: body
+  });
+  if (!resp.ok) {
+    var err = await resp.text().catch(function () { return ""; });
+    throw new Error("写入失败 " + resp.status + " " + err.slice(0, 160));
   }
-  throw new Error("更新冲突，请重试");
 }
 
-function fileRawUrl(entry) {
-  return rawUrl(FILES_DIR + "/" + entry.id + "/" +
-                encodeURIComponent(entry.name));
+// 读取-修改-写入一个 JSON 文件（带失败重试，R2 无 CAS，低并发足够）
+async function rmwJson(path, mutate, message) {
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var cur = null;
+    try { cur = await getJsonViaWorker(path); } catch (e) { cur = null; }
+    var data = Array.isArray(cur) ? cur : [];
+    var next = mutate(data) || data;
+    try {
+      await putRaw(path, JSON.stringify(next), "application/json");
+      return next;
+    } catch (e) {
+      if (attempt >= 3) throw e;
+      await new Promise(function (r) { setTimeout(r, 300 * (attempt + 1)); });
+    }
+  }
+  throw new Error("更新失败，请重试");
+}
+
+// 下载地址：走 R2 公开读（moss:dl 会强制存到系统下载目录并改名）
+function filePubUrl(entry) {
+  return pubUrl("files/" + entry.id);
 }
 
 /* ---------------- 环境徽章 ---------------- */
@@ -343,7 +325,7 @@ function dlButton(entry) {
   var b = document.createElement("a");
   b.className = "btn small primary";
   b.textContent = "下载";
-  b.href = "moss:dl?url=" + encodeURIComponent(fileRawUrl(entry)) +
+  b.href = "moss:dl?url=" + encodeURIComponent(filePubUrl(entry)) +
            "&name=" + encodeURIComponent(entry.name);
   return b;
 }
@@ -377,7 +359,7 @@ function reportButton(entry) {
       c.className = "btn small";
       c.textContent = r;
       c.addEventListener("click", function () {
-        rmwJson(REPORTS_PATH, function (list) {
+        rmwJson("files/_reports.json", function (list) {
           list.push({ id: entry.id, name: entry.name, reason: r,
                       ts: Date.now(), by: (session && session.user) || "匿名" });
           return list;
@@ -470,7 +452,7 @@ async function refreshReports() {
     clear.className = "btn small";
     clear.textContent = "清除";
     clear.addEventListener("click", function () {
-      rmwJson(REPORTS_PATH, function (list) {
+      rmwJson("files/_reports.json", function (list) {
         return list.filter(function (x) { return x.id !== r.id || x.ts !== r.ts; });
       }, "clear report " + r.name).then(refreshReports).catch(function (err) {
         alert("清除失败：" + err.message);
@@ -488,40 +470,12 @@ function refreshAll() {
 }
 
 /* ---------------- 上传 ---------------- */
-function fileToBase64(file) {
-  return new Promise(function (resolve, reject) {
-    var r = new FileReader();
-    r.onload = function () {
-      var s = String(r.result);
-      var i = s.indexOf(",");
-      resolve(i >= 0 ? s.slice(i + 1) : s);
-    };
-    r.onerror = function () { reject(r.error || new Error("读取失败")); };
-    r.readAsDataURL(file);
-  });
-}
-
 async function uploadOne(file, who) {
   var id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  var b64 = await fileToBase64(file);
-  var path = FILES_DIR + "/" + id + "/" + encodeURIComponent(file.name);
-  // 1) 传文件本体
-  var put = await fetch(apiUrl(path), {
-    method: "PUT",
-    headers: authHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      message: "upload " + file.name + " by " + who,
-      content: b64,
-      branch: BRANCH
-    })
-  });
-  if (!put.ok) {
-    var err = await put.text().catch(function () { return ""; });
-    throw new Error("上传「" + file.name + "」失败 " + put.status +
-                    " " + err.slice(0, 160));
-  }
-  // 2) 把这条写进索引（读改写 + 冲突重试）
-  await rmwJson(INDEX_PATH, function (list) {
+  // 1) 传文件本体到 files/<id>（原始字节，content-type 透传，支持任意格式/大文件）
+  await putRaw("files/" + id, file, file.type || "application/octet-stream");
+  // 2) 把这条写进索引（读改写 + 失败重试）
+  await rmwJson("files/_index.json", function (list) {
     list.push({ id: id, name: file.name, by: who, ts: Date.now(),
                 size: file.size });
     return list;
@@ -565,21 +519,16 @@ function handleFiles(list) {
 
 async function delFile(entry) {
   if (!CAN_WRITE) throw new Error("非 MOSS 浏览器，无法删除");
-  var path = FILES_DIR + "/" + entry.id + "/" + encodeURIComponent(entry.name);
-  var cur = await getContent(path);
-  if (cur) {
-    var del = await fetch(apiUrl(path), {
-      method: "DELETE",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        message: "delete " + entry.name,
-        branch: BRANCH, sha: cur.sha
-      })
-    });
-    if (!del.ok) throw new Error("删除文件失败 " + del.status);
+  // 1) 删文件本体
+  var del = await fetch(apiUrl("files/" + entry.id), {
+    method: "DELETE",
+    headers: { "x-moss-key": KEY }
+  });
+  if (!del.ok && del.status !== 404) {
+    throw new Error("删除文件失败 " + del.status);
   }
-  // 从索引移除
-  await rmwJson(INDEX_PATH, function (list) {
+  // 2) 从索引移除
+  await rmwJson("files/_index.json", function (list) {
     return list.filter(function (x) { return x.id !== entry.id; });
   }, "index remove " + entry.name);
 }
